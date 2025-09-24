@@ -56,17 +56,3 @@ To train the model, run this command:
 To evaluate the model, run this command:
 
 ``` python test_2D_fully.py ```
-
-## Citation
-
-```bash
-@article{qiu2025sparsemambapclscribblesupervisedmedicalimage,
-      title={SparseMamba-PCL: Scribble-Supervised Medical Image Segmentation via SAM-Guided Progressive Collaborative Learning}, 
-      author={Luyi Qiu and Tristan Till and Xiaobao Guo and Adams Wai-Kin Kong},
-      year={2025},
-      eprint={2503.01633},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2503.01633}
-}
-``` 
