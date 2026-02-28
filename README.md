@@ -1,7 +1,7 @@
 
 # SPS-Seg: A SAM-Guided Progressive Consistency Framework with Anatomical Priors for Scribble-Supervised Segmentation
 
-#### [📌] The paper is currently under review (not yet published), and the source code will be released only after official acceptance.
+#### [📌] The paper has not yet been published, and the source code will be released upon official publication.
 
 This repository is the official implementation of the paper SPC-Seg
 ## Datasets
