@@ -45,7 +45,7 @@ Some important required packages include:
 
 To train the model, run this command:
 
-```python train_weakly_supervised_segmentation.py```
+```python train_weakly_supervised_spc_seg.py```
 
 
 ## Evaluation
