@@ -3,6 +3,8 @@
 
 👉 Accepted at **IEEE ICASSP 2026**: This repository is the official implementation of the paper SPC-Seg.
 
+The details of the CAPG module are provided in `utils/capg.py`.
+
 ## Datasets
 
 ### ACDC
