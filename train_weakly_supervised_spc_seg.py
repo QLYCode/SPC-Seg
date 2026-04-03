@@ -36,7 +36,7 @@ parser.add_argument('--exp', type=str, default='spc-_capg_pcl_ca9')
 parser.add_argument('--fold', type=str, default='fold5')
 parser.add_argument('--sup_type', type=str, default='scribble')
 parser.add_argument('--model', type=str, default='umamba')
-parser.add_argument('--num_classes', type=int, default=4)
+parser.add_argument('--num_classes', type=int, default=4) # ACDC 4, MSCMRseg 5
 parser.add_argument('--max_iterations', type=int, default=60000)
 parser.add_argument('--batch_size', type=int, default=6)
 parser.add_argument('--deterministic', type=int, default=1)
@@ -260,13 +260,6 @@ def train(args, snapshot_path):
                                 fold=args.fold, sup_type=args.sup_type)
         db_val = BaseDataSets(base_dir=args.root_path, fold=args.fold, split="val")
 
-    elif args.root_path == '../data/CHAOs':
-        from dataloaders.dataset import ChaosDataset, RandomGenerator_chaos
-        db_train = ChaosDataset(args.root_path, split="train",
-                                transform=transforms.Compose([RandomGenerator_chaos(args.patch_size)]),
-                                fold=args.fold, W=W, H=H)
-        db_val = ChaosDataset(args.root_path, split="val", W=W, H=H, fold=args.fold)
-
     elif args.root_path in ('../data/MSCMR', '../data/Abandoned-dataset/MSCMR_dataset'):
         from dataloaders.dataset import MSCMRDataset, RandomGenerator
         db_train = MSCMRDataset(args.root_path, split="train",
@@ -290,11 +283,6 @@ def train(args, snapshot_path):
     if args.root_path == '../data/ACDC':
         ce_loss   = CrossEntropyLoss(ignore_index=4)
         optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
-
-    elif args.root_path == '../data/CHAOs':
-        class_weights = torch.FloatTensor([0.3415, 1.9891, 1.6485, 1.0148, 0.0100]).to(device)
-        ce_loss   = CrossEntropyLoss(weight=class_weights)
-        optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=1e-5)
 
     elif args.root_path in ('../data/MSCMR', '../data/Abandoned-dataset/MSCMR_dataset'):
         ce_loss   = CrossEntropyLoss(ignore_index=4)
