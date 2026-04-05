@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from utils.pcae import PointCloudAccuracyEstimator
 import utils.helpers as helpers
@@ -11,17 +12,29 @@ class CAPromptGenerator(nn.Module):
     """
     Consistency-Aware Prompt Generator (CAPG)
 
-    Implements the three-stage bbox generation described in the paper (Sec. 2.1):
-      1) 1D Projection  — project scribbles S and coarse predictions Y onto x-/y-axes (Eq. 1)
-      2) Consistency Computation — compute D̄_pos/neg, A_pos/neg, CS per axis (Eq. 2–4)
-      3) Consistency Prompt Generation — derive bp, fuse with y-projection, expand by δ_slack (Eq. 5–8)
-
-    Point sampling via PCU is unchanged.
+    Fixes vs. original:
+      [F1] _consistency_score: normalise by actual pixel count (capped at NS_*)
+           instead of fixed NS_*. Prevents d_pos/neg being artificially suppressed
+           when the projection has fewer than NS_* active pixels.
+      [F2] bp_extent = floor((1 - CS) * NS_EQ0):  HIGH consistency → small
+           expansion (trust the scribble boundary); LOW consistency → large
+           expansion (uncertain, be generous). Original had the sign inverted.
+      [F3] bp seed: if scribble is non-empty but bp is still zero after expansion
+           (happens when CS≈0 and extent=0), seed bp directly from s_proj.
+      [F4] Soft hull replaces unconditional union hull: only expand the
+           projection box to cover scribble pixels when the projection box would
+           otherwise *exclude* them. Never expand unconditionally — that was
+           inflating boxes on sparse scribbles and flooding MedSAM with background.
+      [F5] PCU soft-clamp [0.15, 0.85]: prevents degenerate all-pred or
+           all-scribble sampling at the extremes.
+      [F6] Distance-transform-weighted positive point sampling: prefer points
+           near the mask skeleton (far from boundary) — more stable SAM prompts.
     """
 
-    # Fixed pixel counts from the paper (Sec. 2.1, Eq. 2)
-    NS_GT0 = 60   # N_{s>0}: pixels inside enriched scribbles used for D̄_pos
-    NS_EQ0 = 10   # N_{s=0}: pixels outside enriched scribbles used for D̄_neg and bp extent
+    NS_GT0   = 60
+    NS_EQ0   = 10
+    PCU_LO   = 0.15
+    PCU_HI   = 0.85
 
     def __init__(self, n: int, not_n: int, ignore_index: int = 0):
         super().__init__()
@@ -31,7 +44,7 @@ class CAPromptGenerator(nn.Module):
         self.pcu = PointCloudAccuracyEstimator()
 
     # ------------------------------------------------------------------
-    # Stage 1 — 1D Projection (Eq. 1)
+    # Stage 1 — 1D Projection (Eq. 1)  [unchanged]
     # ------------------------------------------------------------------
     @staticmethod
     def _project_1d(mask: np.ndarray):
@@ -41,31 +54,35 @@ class CAPromptGenerator(nn.Module):
 
     # ------------------------------------------------------------------
     # Stage 2 — Consistency Computation (Eq. 2–4)
+    # [F1] use actual pixel counts for normalisation
     # ------------------------------------------------------------------
     @staticmethod
-    def _consistency_score(s_proj: np.ndarray, y_proj: np.ndarray, ns_gt0: int, ns_eq0: int) -> float:
+    def _consistency_score(
+        s_proj: np.ndarray,
+        y_proj: np.ndarray,
+        ns_gt0: int,
+        ns_eq0: int,
+    ) -> float:
         pos_mask = s_proj > 0
         neg_mask = ~pos_mask
 
-        d_pos = float(((1.0 - y_proj[pos_mask]) ** 2).sum()) / max(ns_gt0, 1) if pos_mask.any() else 0.0
-        d_neg = float((y_proj[neg_mask] ** 2).sum())          / max(ns_eq0, 1) if neg_mask.any() else 0.0
+        # [F1] cap at paper constant but don't go below actual count
+        norm_pos = max(min(int(pos_mask.sum()), ns_gt0), 1)
+        norm_neg = max(min(int(neg_mask.sum()), ns_eq0), 1)
+
+        d_pos = float(((1.0 - y_proj[pos_mask]) ** 2).sum()) / norm_pos if pos_mask.any() else 0.0
+        d_neg = float((y_proj[neg_mask] ** 2).sum())          / norm_neg if neg_mask.any() else 0.0
 
         a_pos = 1.0 / (1.0 + d_pos)
         a_neg = 1.0 / (1.0 + d_neg)
         return min(a_pos, a_neg)
 
     # ------------------------------------------------------------------
-    # Stage 3 — Consistency Prompt Generation (Eq. 5–8)
+    # Stage 3a — bp expansion
+    # [F2] inverted extent: high CS → small expansion (trust boundary)
     # ------------------------------------------------------------------
     @staticmethod
     def _expand_proj(s_proj: np.ndarray, bp_extent: int, length: int) -> np.ndarray:
-        """
-        Eq. 5 正确语义：
-        bp_extent = ⌊CS · N_{s=0}⌋ 是 scribble 投影边界的外扩半径（像素数）。
-        取 scribble 投影的非零区间 [lo, hi]，向外各扩 bp_extent 列/行，
-        得到 bp 二值投影向量。
-        当 scribble 投影为空时返回全零向量（由调用方兜底）。
-        """
         bp = np.zeros(length, dtype=np.float32)
         nonzero = np.where(s_proj > 0)[0]
         if len(nonzero) == 0:
@@ -75,11 +92,14 @@ class CAPromptGenerator(nn.Module):
         bp[lo: hi + 1] = 1.0
         return bp
 
+    # ------------------------------------------------------------------
+    # Bbox generation
+    # ------------------------------------------------------------------
     def _bboxes_from_projection_consistency(
         self,
-        scribbles_np: np.ndarray,   # (B, C, H, W) per-class one-hot scribble
-        pred_oh_np:   np.ndarray,   # (B, C, H, W) argmax one-hot prediction
-        probs_np:     np.ndarray,   # (B, C, H, W) softmax probabilities（兜底用）
+        scribbles_np: np.ndarray,
+        pred_oh_np:   np.ndarray,
+        probs_np:     np.ndarray,
         H: int,
         W: int,
         delta_slack: int = 10,
@@ -92,105 +112,143 @@ class CAPromptGenerator(nn.Module):
                 if c == self.ignore_index:
                     continue
 
-                S      = scribbles_np[b, c].astype(np.float32)
-                Y      = pred_oh_np[b, c].astype(np.float32)
-                Pprob  = probs_np[b, c]                          # (H, W) float
+                S     = scribbles_np[b, c].astype(np.float32)
+                Y     = pred_oh_np[b, c].astype(np.float32)
+                Pprob = probs_np[b, c]                        # (H, W)
 
-                # Stage 1 — 1D projections
+                # Stage 1
                 s_x, s_y = self._project_1d(S)
                 y_x, y_y = self._project_1d(Y)
 
-                # Stage 2 — consistency scores
+                # Stage 2
                 cs_x = self._consistency_score(s_x, y_x, self.NS_GT0, self.NS_EQ0)
                 cs_y = self._consistency_score(s_y, y_y, self.NS_GT0, self.NS_EQ0)
 
-                # Stage 3a — bp：scribble 投影边界外扩 bp_extent 个像素 (Eq. 5 正确语义)
-                bp_x_extent = int(cs_x * self.NS_EQ0)
-                bp_y_extent = int(cs_y * self.NS_EQ0)
+                # Stage 3a — [F2] (1-CS)*NS_EQ0: high CS → tight boundary
+                bp_x_extent = int((1.0 - cs_x) * self.NS_EQ0)
+                bp_y_extent = int((1.0 - cs_y) * self.NS_EQ0)
                 bp_x = self._expand_proj(s_x, bp_x_extent, W)
                 bp_y = self._expand_proj(s_y, bp_y_extent, H)
 
-                # Stage 3b — OR fusion with coarse prediction (Eq. 6)
+                # [F3] seed bp from s_proj when scribble exists but bp still empty
+                if not bp_x.any() and s_x.any():
+                    bp_x = s_x.copy()
+                if not bp_y.any() and s_y.any():
+                    bp_y = s_y.copy()
+
+                # Stage 3b — OR fusion (Eq. 6)
                 p_x = np.clip(bp_x + y_x, 0.0, 1.0)
                 p_y = np.clip(bp_y + y_y, 0.0, 1.0)
 
-                # 兜底 1：scribble 为空但预测非空，直接用预测投影
+                # Fallback 1: scribble absent, prediction present
                 if not p_x.any():
                     p_x = y_x.copy()
                 if not p_y.any():
                     p_y = y_y.copy()
 
-                # 兜底 2：预测也全空，用 softmax 概率投影（max over rows/cols）
+                # Fallback 2: both empty → softmax probability projection
                 if not p_x.any() or not p_y.any():
-                    prob_x = Pprob.max(axis=0)   # (W,)
-                    prob_y = Pprob.max(axis=1)   # (H,)
-                    tau = float(np.percentile(Pprob, 90))
+                    prob_x = Pprob.max(axis=0)
+                    prob_y = Pprob.max(axis=1)
+                    tau = float(np.percentile(Pprob, 75))   # 75th (was 90th, too aggressive)
                     if not p_x.any():
                         p_x = (prob_x >= tau).astype(np.float32)
                     if not p_y.any():
                         p_y = (prob_y >= tau).astype(np.float32)
 
-                # 仍为空 → 零框
                 if not p_x.any() or not p_y.any():
                     continue
 
                 # Stage 3c — min/max + slack (Eq. 7–8)
-                x_nonzero = np.where(p_x > 0)[0]
-                y_nonzero = np.where(p_y > 0)[0]
-                x_min = int(max(0,     x_nonzero.min() - delta_slack))
-                x_max = int(min(W - 1, x_nonzero.max() + delta_slack))
-                y_min = int(max(0,     y_nonzero.min() - delta_slack))
-                y_max = int(min(H - 1, y_nonzero.max() + delta_slack))
+                x_nz = np.where(p_x > 0)[0]
+                y_nz = np.where(p_y > 0)[0]
+                x_min = int(max(0,     x_nz.min() - delta_slack))
+                x_max = int(min(W - 1, x_nz.max() + delta_slack))
+                y_min = int(max(0,     y_nz.min() - delta_slack))
+                y_max = int(min(H - 1, y_nz.max() + delta_slack))
 
-                # 与 2D scribble 直接 bbox 取并集（union hull）：
-                # 保证 1D projection 框不比"scribble 直接外接框 + slack"更小，
-                # 防止稀疏 scribble 场景下框过紧导致 MedSAM 漏分割。
+                # [F4] soft hull: only expand when projection box clips scribble pixels
+                # (prevents silent under-coverage without inflating the box generally)
                 scr_ys, scr_xs = np.where(S > 0)
                 if len(scr_xs) > 0:
                     sx_min = int(max(0,     scr_xs.min() - delta_slack))
                     sx_max = int(min(W - 1, scr_xs.max() + delta_slack))
                     sy_min = int(max(0,     scr_ys.min() - delta_slack))
                     sy_max = int(min(H - 1, scr_ys.max() + delta_slack))
-                    x_min = min(x_min, sx_min)
-                    x_max = max(x_max, sx_max)
-                    y_min = min(y_min, sy_min)
-                    y_max = max(y_max, sy_max)
+                    if x_min > sx_min or x_max < sx_max:
+                        x_min = min(x_min, sx_min)
+                        x_max = max(x_max, sx_max)
+                    if y_min > sy_min or y_max < sy_max:
+                        y_min = min(y_min, sy_min)
+                        y_max = max(y_max, sy_max)
 
-                bboxes[b, c] = torch.tensor([x_min, y_min, x_max, y_max], dtype=torch.float32)
+                bboxes[b, c] = torch.tensor(
+                    [x_min, y_min, x_max, y_max], dtype=torch.float32
+                )
 
         return bboxes   # (B, C, 4)
 
     # ------------------------------------------------------------------
-    # Unchanged helpers (PCU interface, point sampling)
+    # Point sampling helpers
+    # [F6] distance-transform-weighted positive sampling
     # ------------------------------------------------------------------
     @staticmethod
     def _safe_choice(arr: np.ndarray, k: int):
-        """Sample k rows from arr; sample with replacement if arr is smaller than k."""
         if len(arr) == 0:
             return arr
         replace = len(arr) < k
         idx = np.random.choice(len(arr), k, replace=replace)
         return arr[idx]
 
+    @staticmethod
+    def _weighted_choice(coords: np.ndarray, k: int, mask: np.ndarray) -> np.ndarray:
+        """
+        Sample k points from coords, weighted by distance-transform of mask.
+        Falls back to uniform sampling when mask is too small to bother.
+        """
+        if len(coords) == 0:
+            return coords
+        if len(coords) < k * 2:
+            # Too few candidates — uniform is fine
+            replace = len(coords) < k
+            return coords[np.random.choice(len(coords), k, replace=replace)]
+
+        # Distance transform on the binary mask
+        dist = distance_transform_edt(mask)
+        w = dist[coords[:, 0], coords[:, 1]].astype(np.float64)
+        w_sum = w.sum()
+        if w_sum < 1e-8:
+            replace = len(coords) < k
+            return coords[np.random.choice(len(coords), k, replace=replace)]
+        w /= w_sum
+        idx = np.random.choice(len(coords), k, replace=False, p=w)
+        return coords[idx]
+
     def _get_points(self, coords: np.ndarray, n: int):
         if n <= 0:
             return np.empty((0, 2), dtype=np.int64)
         return self._safe_choice(coords, n)
 
-    def _reduce_mask(self, binary_mask: np.ndarray, background_mask: np.ndarray, k_pos: int, k_bg: int):
-        """
-        Sample k_pos positive points from binary_mask and k_bg negative points from background_mask.
-
-        Returns:
-            coords: (k_pos+k_bg, 2) — (y, x)
-            labels: (k_pos+k_bg,)   — 1/0
-        """
+    def _reduce_mask(
+        self,
+        binary_mask: np.ndarray,
+        background_mask: np.ndarray,
+        k_pos: int,
+        k_bg: int,
+    ):
         fg_ys, fg_xs = np.where(binary_mask > 0)
         bg_ys, bg_xs = np.where(background_mask > 0)
         fg_coords = np.stack([fg_ys, fg_xs], axis=1) if len(fg_ys) else np.empty((0, 2), dtype=np.int64)
         bg_coords = np.stack([bg_ys, bg_xs], axis=1) if len(bg_ys) else np.empty((0, 2), dtype=np.int64)
-        pos_pts = self._get_points(fg_coords, max(k_pos, 0))
+
+        # [F6] distance-weighted positive sampling; uniform for negatives
+        if k_pos > 0 and len(fg_coords) > 0:
+            pos_pts = self._weighted_choice(fg_coords, max(k_pos, 0), binary_mask)
+        else:
+            pos_pts = self._get_points(fg_coords, max(k_pos, 0))
+
         neg_pts = self._get_points(bg_coords, max(k_bg, 0))
+
         coords = (
             np.concatenate([pos_pts, neg_pts], axis=0)
             if (len(pos_pts) or len(neg_pts))
@@ -198,7 +256,9 @@ class CAPromptGenerator(nn.Module):
         )
         labels = (
             np.concatenate(
-                [np.ones(len(pos_pts), dtype=np.int64), np.zeros(len(neg_pts), dtype=np.int64)], axis=0
+                [np.ones(len(pos_pts), dtype=np.int64),
+                 np.zeros(len(neg_pts), dtype=np.int64)],
+                axis=0,
             )
             if (len(pos_pts) or len(neg_pts))
             else np.empty((0,), dtype=np.int64)
@@ -206,7 +266,6 @@ class CAPromptGenerator(nn.Module):
         return coords, labels
 
     def forward_pcu(self, labels_4d_torch: torch.Tensor, out_onehot_np: np.ndarray):
-        """Preserved PCU interface — unchanged."""
         return self.pcu(labels_4d_torch, out_onehot_np)
 
     # ------------------------------------------------------------------
@@ -216,8 +275,6 @@ class CAPromptGenerator(nn.Module):
         """
         Args:
             scribbles: (B, H, W) or (B, 1, H, W)
-                - Binary/sparse mask {0,1}: broadcast to every class channel.
-                - Class-ID label map (values 0..C-1, 255 ignored): converted to per-class one-hot.
             outputs:   (B, C, H, W) logits or probabilities.
 
         Returns:
@@ -243,33 +300,28 @@ class CAPromptGenerator(nn.Module):
             s = torch.where(ignore_mask_255, torch.zeros_like(s), s)
 
         if s.max().item() <= 1 and s.min().item() >= 0:
-            # Binary/sparse mask — broadcast to all class channels
             scribbles_t = s[:, None, :, :].repeat(1, C, 1, 1)
         else:
-            # Class-ID map — convert to one-hot
             s = torch.clamp(s, 0, C - 1)
             scribbles_t = F.one_hot(s, num_classes=C).permute(0, 3, 1, 2).contiguous()
 
-        # --- Numpy arrays for PCU and bbox ---
-        outputs_oh  = helpers.to_onehot(outputs).detach().cpu().numpy()         # (B,C,H,W) PCU one-hot
-        pred_lbl    = outputs.argmax(dim=1)                                      # (B,H,W)
-        pred_oh_np  = (
+        # --- Numpy arrays ---
+        outputs_oh = helpers.to_onehot(outputs).detach().cpu().numpy()
+        pred_lbl   = outputs.argmax(dim=1)
+        pred_oh_np = (
             F.one_hot(pred_lbl, num_classes=C)
             .permute(0, 3, 1, 2)
             .contiguous()
             .detach().cpu().numpy()
-        )                                                                         # (B,C,H,W) strict argmax
-
-        scribbles_np    = scribbles_t.detach().cpu().numpy()                     # (B,C,H,W)
+        )
+        scribbles_np    = scribbles_t.detach().cpu().numpy()
         scribbles_cpu_t = torch.from_numpy(scribbles_np)
-
-        # softmax 概率（兜底用）
-        probs_np = F.softmax(outputs, dim=1).detach().cpu().numpy()              # (B,C,H,W)
+        probs_np        = F.softmax(outputs, dim=1).detach().cpu().numpy()
 
         # --- PCU ---
         pcu = self.forward_pcu(scribbles_cpu_t, outputs_oh)
 
-        # --- Point sampling (unchanged) ---
+        # --- Point sampling ---
         points_list, labels_list = [], []
         need = self.n + self.not_n
         for b in range(B):
@@ -278,10 +330,13 @@ class CAPromptGenerator(nn.Module):
 
             for c in range(C):
                 pcu_bc = float(pcu[b][c].item()) if hasattr(pcu, "shape") else float(pcu[b][c])
-                num_pred      = int(round(pcu_bc       * self.n,     0))
-                num_scribble  = self.n     - num_pred
-                num_not_pred  = int(round((1 - pcu_bc) * self.not_n, 0))
-                num_not_scrib = self.not_n - num_not_pred
+                # [F5] soft-clamp PCU to avoid degenerate all-one-source sampling
+                pcu_bc = float(np.clip(pcu_bc, self.PCU_LO, self.PCU_HI))
+
+                num_pred      = int(round(pcu_bc         * self.n,     0))
+                num_scribble  = self.n       - num_pred
+                num_not_pred  = int(round((1.0 - pcu_bc) * self.not_n, 0))
+                num_not_scrib = self.not_n   - num_not_pred
 
                 scrib_c = scribbles_np[b, c]
                 scrib_0 = scribbles_np[b, 0]
@@ -312,20 +367,16 @@ class CAPromptGenerator(nn.Module):
             points_list.append(torch.as_tensor(img_prompt, dtype=torch.long))
             labels_list.append(torch.as_tensor(img_labels, dtype=torch.long))
 
-        points = torch.stack(points_list, dim=0)   # (B, C, N, 2)
-        labels = torch.stack(labels_list, dim=0)   # (B, C, N)
+        points = torch.stack(points_list, dim=0)
+        labels = torch.stack(labels_list, dim=0)
 
-        # --- Bounding boxes via paper-faithful 1D projection consistency (Eq. 1–8) ---
+        # --- Bboxes ---
         bboxes = self._bboxes_from_projection_consistency(
             scribbles_np=scribbles_np,
             pred_oh_np=pred_oh_np,
             probs_np=probs_np,
             H=H, W=W,
             delta_slack=10,
-        )   # (B, C, 4) float32 on CPU
+        )
 
-        points = points.to(device)
-        labels = labels.to(device)
-        bboxes = bboxes.to(device)
-
-        return points, labels, bboxes
+        return points.to(device), labels.to(device), bboxes.to(device)
