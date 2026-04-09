@@ -24,7 +24,7 @@ import cv2
 from torch.nn import functional as F
 import torch.nn as nn
 
-gpu_id = 2
+gpu_id = 1
 device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser()
@@ -240,7 +240,6 @@ def train(args, snapshot_path):
         ce_loss   = CrossEntropyLoss(ignore_index=4)
         optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
-    # ── [FIX-1] CAPG 在循环外实例化一次 ──────────────────────────────
     from utils.capg import CAPromptGenerator
     capg = CAPromptGenerator(n=60, not_n=10, ignore_index=0).to(device)
 
@@ -251,6 +250,9 @@ def train(args, snapshot_path):
     iterator         = tqdm(range(max_epoch), ncols=70)
 
     logging.info("{} iterations per epoch".format(len(trainloader)))
+
+    # 置信度过滤基准阈值
+    CONF_THRESH_BASE = 0.6
 
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
@@ -278,7 +280,7 @@ def train(args, snapshot_path):
             except Exception:
                 pass
 
-            # ④ CAPG 生成提示（使用循环外的 capg 实例）
+            # ④ CAPG 生成提示
             points, labels_capg, bboxes = capg(label_batch, outputs_soft)
 
             B_val, C1, _ = bboxes.shape
@@ -310,36 +312,34 @@ def train(args, snapshot_path):
                         bounding_boxes.append([batch_idx, class_id, x, y, w_box, h_box])
                         edges = cv2.Canny(class_mask * 255, 100, 200)
                         edges_list.append((batch_idx, class_id, edges))
-                        box_np   = np.array([x, y, x + w_box, y + h_box], dtype=np.float32)
-                        box_1024 = box_np / np.array(
-                            [W_img, H_img, W_img, H_img], dtype=np.float32) * 1024.0
 
+                        # [FIX-B] 使用 union box 而非 intersection，避免空框
+                        box_pred_np = np.array([x, y, x + w_box, y + h_box], dtype=np.float32)
                         contours_scr, _ = cv2.findContours(
                             label_class_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         x_scr, y_scr, w_scr, h_scr = cv2.boundingRect(contours_scr[0])
-                        box_scr_np   = np.array(
+                        box_scr_np = np.array(
                             [x_scr, y_scr, x_scr + w_scr, y_scr + h_scr], dtype=np.float32)
-                        box_scr_1024 = box_scr_np / np.array(
-                            [W_img, H_img, W_img, H_img], dtype=np.float32) * 1024.0
-                        ext = 10
-                        box_scr_1024_Aug = box_scr_1024.copy()
-                        box_scr_1024_Aug[0] = max(0,    box_scr_1024_Aug[0] - ext)
-                        box_scr_1024_Aug[1] = max(0,    box_scr_1024_Aug[1] - ext)
-                        box_scr_1024_Aug[2] = min(1024, box_scr_1024_Aug[2] + ext)
-                        box_scr_1024_Aug[3] = min(1024, box_scr_1024_Aug[3] + ext)
 
-                        box_1024 = np.array([
-                            max(box_scr_1024_Aug[0], box_1024[0]),
-                            max(box_scr_1024_Aug[1], box_1024[1]),
-                            min(box_scr_1024_Aug[2], box_1024[2]),
-                            min(box_scr_1024_Aug[3], box_1024[3]),
+                        # Union: 取两框的外包围盒
+                        box_union_np = np.array([
+                            min(box_pred_np[0], box_scr_np[0]),
+                            min(box_pred_np[1], box_scr_np[1]),
+                            max(box_pred_np[2], box_scr_np[2]),
+                            max(box_pred_np[3], box_scr_np[3]),
                         ], dtype=np.float32)
+
+                        ext = 10
+                        box_union_np[0] = max(0,     box_union_np[0] - ext)
+                        box_union_np[1] = max(0,     box_union_np[1] - ext)
+                        box_union_np[2] = min(W_img, box_union_np[2] + ext)
+                        box_union_np[3] = min(H_img, box_union_np[3] + ext)
+
+                        box_1024 = box_union_np / np.array(
+                            [W_img, H_img, W_img, H_img], dtype=np.float32) * 1024.0
 
                         if (box_1024[2] > box_1024[0]) and (box_1024[3] > box_1024[1]):
                             fallback_xyxy_pix = xyxy_1024_to_pixels(box_1024, H_img, W_img)
-                        elif (box_scr_1024_Aug[2] > box_scr_1024_Aug[0]) and \
-                             (box_scr_1024_Aug[3] > box_scr_1024_Aug[1]):
-                            fallback_xyxy_pix = xyxy_1024_to_pixels(box_scr_1024_Aug, H_img, W_img)
 
                     boxes_Nx4 = make_boxes_Nx4(
                         bboxes=bboxes, batch_idx=batch_idx, class_id=class_id,
@@ -362,52 +362,49 @@ def train(args, snapshot_path):
 
                 medsam_seg_list.append(medsam_seg_batch_list)
 
-            for batch_idx, class_id, edges in edges_list:
-                writer.add_image(f'train/edges_class_{class_id}_batch_{batch_idx}',
-                                 torch.tensor(edges).unsqueeze(0).float(), iter_num)
+            if iter_num % 20 == 0:
+                for batch_idx, class_id, edges in edges_list:
+                    writer.add_image(f'train/edges_class_{class_id}_batch_{batch_idx}',
+                                     torch.tensor(edges).unsqueeze(0).float(), iter_num)
 
             # ⑥ 组装 MedSAM 输出 (B, C1, H, W)
             medsam_per_class  = [torch.cat(cls_list, dim=0) for cls_list in medsam_seg_list]
             medsam_seg_output = torch.stack(medsam_per_class, dim=1).squeeze(2).to(device)
-            # medsam_seg_output: (B, C1, H, W)  — float, values in {class_id, 4}
 
-            # ⑦ [FIX-5] 通道注意力：medsam_seg_output 与 outputs 分别按类配对
-            #    原代码将 outputs(B,C,H,W) reshape 成 (B*C,1,H,W) 语义错乱；
-            #    正确做法：对每个类取该类的 softmax 概率作为第二通道。
+            # ⑦ 通道注意力：逐类配对
             medsam_att_list = []
             for c_idx in range(C1):
-                # medsam 输出该类的 one-hot：1=该类，0=其他（4→忽略，这里仅用于注意力）
-                mseg_c = medsam_seg_output[:, c_idx:c_idx+1, :, :]  # (B,1,H,W)
-                # 对应类的 softmax 概率作为第二通道
-                prob_c = outputs_soft[:, c_idx:c_idx+1, :, :]        # (B,1,H,W)
-                two_ch = torch.cat([mseg_c, prob_c], dim=1)          # (B,2,H,W)
-                att    = model.channel_attention(two_ch)              # (B,2,H,W)
-                merged = model.merge_channel(att)                     # (B,1,H,W)
+                mseg_c = medsam_seg_output[:, c_idx:c_idx+1, :, :]
+                prob_c = outputs_soft[:, c_idx:c_idx+1, :, :]
+                two_ch = torch.cat([mseg_c, prob_c], dim=1)
+                att    = model.channel_attention(two_ch)
+                merged = model.merge_channel(att)
                 medsam_att_list.append(merged)
-            # (B, C1, H, W)
-            medsam_att = torch.cat(medsam_att_list, dim=1)
+            medsam_att = torch.cat(medsam_att_list, dim=1)  # (B, C1, H, W)
 
-            # ⑧ [FIX-2] 伪标签融合 + 直接监督 MedSAM 输出质量
+            # ⑧ [FIX-C] 融合 + 损失计算
             alpha        = 0.5
-            pseudo_logit = (1 - alpha) * medsam_att + alpha * outputs   # (B, C, H, W)
+            pseudo_logit = (1 - alpha) * medsam_att + alpha * outputs
 
-            # medsam_seg_loss：直接对 medsam_att（MedSAM 输出经注意力后）算 CE，
-            # 而不是对融合后的 pseudo_logit 算，这样梯度能真正督促 MedSAM 分支改善
+            # [FIX-D] MedSAM 分支权重固定为小值，不随训练增大
+            w_medsam = 0.3
+
             medsam_seg_loss = ce_loss(medsam_att, label_batch.long())
 
-            pseudo_label = torch.argmax(pseudo_logit, dim=1)   # (B, H, W)
+            # [FIX-E] 置信度过滤伪标签
+            progress    = iter_num / max_iterations
+            conf_thresh = CONF_THRESH_BASE + 0.1 * progress   # 0.60 → 0.70
+            max_prob, pseudo_label = torch.max(torch.softmax(pseudo_logit, dim=1), dim=1)
+            pseudo_label_filtered = pseudo_label.clone()
+            pseudo_label_filtered[max_prob < conf_thresh] = 4  # ignore
 
-            # ⑨ [FIX-3] 动态 l_pls 权重：训练前期小权重避免噪声标签干扰，
-            #    后期随 pseudo_label 质量提升逐步加大
-            progress   = iter_num / max_iterations            # 0 → 1
-            w_pls      = 0.1 + 0.4 * progress                # 0.1 → 0.5
+            # [FIX-F] w_pls 固定上限 0.3，不继续增大
+            w_pls = min(0.3, 0.3 * progress / 0.3) if progress < 0.3 else 0.3
 
             loss_ce = ce_loss(outputs, label_batch.long())
-            l_pls   = dice_loss(outputs, pseudo_label) + dice_loss(medsam_att, pseudo_label)
 
-            # [FIX-3] 动态 medsam 权重：后期加重对 MedSAM 分支的监督，
-            #    防止 medsam_seg_loss 过早塌缩到 0
-            w_medsam = 0.5 + 0.5 * progress                  # 0.5 → 1.0
+            # [FIX-G] 伪标签只监督主干，不再对 medsam_att 加 dice 监督
+            l_pls = dice_loss(outputs, pseudo_label_filtered)
 
             loss = loss_ce + w_medsam * medsam_seg_loss + w_pls * l_pls
 
@@ -429,6 +426,7 @@ def train(args, snapshot_path):
             writer.add_scalar('info/l_pls',           l_pls,           iter_num)
             writer.add_scalar('info/w_pls',           w_pls,           iter_num)
             writer.add_scalar('info/w_medsam',        w_medsam,        iter_num)
+            writer.add_scalar('info/conf_thresh',     conf_thresh,     iter_num)
 
             logging.info(
                 'iteration %d : loss : %f, loss_ce: %f, medsam_seg_loss: %f, l_pls: %f' %
